@@ -1,0 +1,25 @@
+# Font settings
+font.family: serif
+font.serif: Computer Modern Roman, DejaVu Serif, Times New Roman
+font.size: 30
+axes.labelsize: 30
+axes.titlesize: 30
+xtick.labelsize: 30
+ytick.labelsize: 30
+legend.fontsize: 20
+figure.titlesize: 30
+
+# Line thickness
+lines.linewidth: 4
+
+# LaTeX settings
+text.usetex: True
+text.latex.preamble: \usepackage{amsmath}\usepackage{amssymb}\usepackage{bm}
+
+# Figure settings
+figure.dpi: 600
+savefig.dpi: 600
+savefig.bbox: tight
+
+axes.spines.top: False
+axes.spines.right: False
