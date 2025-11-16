@@ -14,24 +14,33 @@ The goal is to make the region `x_3 > t_threshold` as forward invariant as possi
 
 ### ⚡ Quick Start (Integrated Workflow)
 
-The **recommended approach** is to run just the `controlled.py` script, which automatically handles both sensor optimization and control policy optimization:
+The **recommended approach** is to run just the `controlled.py` script, which automatically handles sensor optimization, actuator optimization (optional), and control policy optimization:
 
 ```bash
-# One-step optimization: sensors + control policy
-python controlled.py --auto-sensors --num-sensors 2 --c-max 1.0 --threshold 0.0 --maxiter 50 --n-cpus 8
+# One-step optimization: sensors + control policy (manual actuators)
+python controlled.py --auto-sensors --num-sensors 2 --actuate 2 --c-max 1.0 --threshold 0.0 --maxiter 50 --n-cpus 8
+
+# OR: Optimize sensors AND actuators automatically (NEW!)
+python controlled.py --auto-sensors --num-sensors 2 --auto-actuators --num-actuators 2 \
+  --actuator-maxiter 50 --actuator-policy-maxiter 10 --threshold 0.0 --maxiter 30 --n-cpus 8
 ```
 
 This will:
 1. Automatically optimize sensor locations via mutual information
-2. Use those sensors to optimize the control policy
-3. Save both sensor results and policy parameters
+2. (Optional) Automatically optimize actuator locations to maximize containment probability
+3. Use those sensors and actuators to optimize the control policy
+4. Save sensor results, actuator results (if optimized), and policy parameters
 
 **Key parameters:**
 - `--auto-sensors`: Enable automatic sensor optimization
 - `--num-sensors`: Number of sensors (default: 2)
 - `--sensor-T`: Simulation time for sensor data (default: 10000)
 - `--sensor-maxiter`: CMA-ES iterations for sensors (default: 200)
-- `--actuate`: State indices to actuate (default: [2] for x_3 only)
+- `--actuate`: State indices to actuate (default: [2] for x_3 only; optional if using --auto-actuators)
+- `--auto-actuators`: Enable automatic actuator optimization (NEW!)
+- `--num-actuators`: Number of actuators for auto-optimization (default: 2)
+- `--actuator-maxiter`: CMA-ES iterations for actuators (default: 100)
+- `--actuator-policy-maxiter`: Inner policy iterations during actuator search (default: 20)
 - `--c-max`: Actuation capacity (default: 1.0)
 - `--threshold`: Target threshold t (default: 0.0)
 - `--poly-order`: Polynomial order (1, 2, or 3; default: 2)
@@ -39,8 +48,10 @@ This will:
 - `--n-cpus`: Number of CPUs for parallel evaluation (default: 1)
 
 **Outputs:**
-- `sensors_auto_2.npz`: Optimized sensor locations
-- `policy_cm1p0_act2_p2.npz`: Optimized control policy
+- `sensors_auto_2.npz`: Optimized sensor locations (if using --auto-sensors)
+- `actuators_auto_2.npz`: Optimized actuator locations (if using --auto-actuators)
+- `policy_cm1p0_act2_p2.npz`: Optimized control policy (manual actuators)
+- `policy_cm1p0_actopt2_p2.npz`: Optimized control policy (optimized actuators)
 
 ### Alternative: Manual Sensor Specification
 
@@ -121,12 +132,13 @@ python post.py --T 2000
 
 - **uncontrolled.py**: Lorenz 96 simulation without control
 - **optimal_sensors.py**: Standalone mutual information-based sensor placement
-- **controlled.py**: **Integrated sensor optimization + polynomial policy optimization** via CMA-ES
+- **controlled.py**: **Integrated sensor + actuator + policy optimization** via CMA-ES
 - **post.py**: Post-processing and visualization
 - **kl_bound_cmaes.py**: Lower bound computation utilities
 - **plot_style.mplstyle**: Matplotlib style configuration
+- **ACTUATOR_OPTIMIZATION.md**: Detailed documentation for actuator optimization feature
 
-> **Note**: `controlled.py` now includes integrated sensor optimization. You can run just this script with `--auto-sensors` flag to solve both problems at once!
+> **Note**: `controlled.py` now includes integrated sensor AND actuator optimization! You can run just this script with `--auto-sensors` and `--auto-actuators` flags to optimize everything at once!
 
 ## Requirements
 

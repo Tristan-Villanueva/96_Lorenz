@@ -43,8 +43,31 @@ def parse_args() -> argparse.Namespace:
         "--actuate",
         type=int,
         nargs="+",
-        default=[2],
-        help="State indices to actuate (space-separated, 0-indexed). Default: 2 (x_3)",
+        default=None,
+        help="State indices to actuate (space-separated, 0-indexed). Overrides --auto-actuators.",
+    )
+    parser.add_argument(
+        "--auto-actuators",
+        action="store_true",
+        help="Automatically optimize actuator locations to maximize containment probability",
+    )
+    parser.add_argument(
+        "--num-actuators",
+        type=int,
+        default=2,
+        help="Number of actuators for auto-optimization (default: 2)",
+    )
+    parser.add_argument(
+        "--actuator-maxiter",
+        type=int,
+        default=100,
+        help="CMA-ES iterations for actuator optimization (default: 100)",
+    )
+    parser.add_argument(
+        "--actuator-policy-maxiter",
+        type=int,
+        default=20,
+        help="CMA-ES iterations for policy optimization during actuator search (default: 20)",
     )
     parser.add_argument(
         "--sensor-file",
@@ -1074,6 +1097,262 @@ def optimize_sensor_locations(
 
 
 # --------------------------------------------------------------------------- #
+# Actuator Optimization Functions
+# --------------------------------------------------------------------------- #
+
+
+class ActuatorObjective:
+    """Objective function for actuator placement optimization.
+    
+    This performs a nested optimization:
+    - Outer loop: optimize actuator locations
+    - Inner loop: for each actuator configuration, optimize control policy
+    
+    The objective is to maximize the containment probability P(x_target > threshold).
+    """
+    
+    def __init__(
+        self,
+        sensed_dims: List[int],
+        num_actuators: int,
+        N: int,
+        sim_config: SimulationConfig,
+        objective_config: ControlObjectiveConfig,
+        poly_order: int,
+        sigma0: float,
+        maxiter: int,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.sensed_dims = sensed_dims
+        self.num_actuators = num_actuators
+        self.N = N
+        self.sim_config = sim_config
+        self.objective_config = objective_config
+        self.poly_order = poly_order
+        self.sigma0 = sigma0
+        self.maxiter = maxiter
+        self.seed = seed
+        
+        if num_actuators <= 0:
+            raise ValueError("`num_actuators` must be positive.")
+        if num_actuators >= N:
+            raise ValueError(f"`num_actuators` ({num_actuators}) must be less than N ({N}).")
+        
+        self.evaluation_count = 0
+    
+    def __call__(self, theta: np.ndarray) -> float:
+        """CMA-ES objective: minimize negative containment probability."""
+        if theta.size != self.num_actuators:
+            raise ValueError(f"Expected {self.num_actuators} parameters, received {theta.size}.")
+        
+        self.evaluation_count += 1
+        actuated_dims = self._parameters_to_indices(theta)
+        
+        # Create policy with these actuator locations
+        try:
+            policy = PolynomialPolicy(
+                actuated_dims=actuated_dims,
+                sensed_dims=self.sensed_dims,
+                poly_order=self.poly_order,
+                N=self.N,
+            )
+        except Exception as e:
+            print(f"  [Eval {self.evaluation_count}] Invalid actuator config {actuated_dims}: {e}")
+            return 1e6
+        
+        # Create objective evaluator
+        evaluator = ControlObjectiveEvaluator(
+            policy_template=policy,
+            sim_config=self.sim_config,
+            objective_config=self.objective_config,
+        )
+        
+        # Run quick policy optimization
+        try:
+            result = optimize_policy_cmaes(
+                objective=evaluator,
+                sigma0=self.sigma0,
+                maxiter=self.maxiter,
+                seed=self.seed,
+                n_cpus=1,  # No parallelization in nested optimization
+            )
+            containment_prob = result.best_true_prob
+            
+            print(f"  [Eval {self.evaluation_count}] Actuators {actuated_dims} → P(x_target > threshold) = {containment_prob:.6f}")
+            
+            # Minimize negative probability (maximize probability)
+            return -containment_prob
+        except Exception as e:
+            print(f"  [Eval {self.evaluation_count}] Failed for actuators {actuated_dims}: {e}")
+            return 1e6
+    
+    def _parameters_to_indices(self, theta: np.ndarray) -> List[int]:
+        """Convert continuous parameters to discrete actuator indices."""
+        indices = np.clip(theta, 0, self.N - 1)
+        indices = np.round(indices).astype(int)
+        indices = self._ensure_unique_indices(indices)
+        return list(indices)
+    
+    def _ensure_unique_indices(self, indices: np.ndarray) -> np.ndarray:
+        """Ensure all indices are unique by adjusting duplicates."""
+        unique_indices = []
+        used = set()
+        
+        for idx in indices:
+            if idx in used:
+                for offset in range(1, self.N):
+                    candidate_low = (idx - offset) % self.N
+                    if candidate_low not in used:
+                        idx = candidate_low
+                        break
+                    candidate_high = (idx + offset) % self.N
+                    if candidate_high not in used:
+                        idx = candidate_high
+                        break
+            
+            unique_indices.append(idx)
+            used.add(idx)
+        
+        return np.array(unique_indices, dtype=int)
+    
+    def decode_parameters(self, theta: np.ndarray) -> List[int]:
+        """Convert parameters to actuator indices."""
+        if theta.size != self.num_actuators:
+            raise ValueError(f"Expected {self.num_actuators} parameters, received {theta.size}.")
+        return self._parameters_to_indices(theta)
+
+
+def optimize_actuator_locations(
+    *,
+    sensed_dims: List[int],
+    num_actuators: int,
+    N: int,
+    F: float,
+    dt: float,
+    T: float,
+    transient: float,
+    target_variable: int,
+    threshold: float,
+    c_max: float,
+    lambda_control: float,
+    bin_width: float,
+    lb_maxiter: int,
+    poly_order: int,
+    seed: int,
+    maxiter: int,
+    policy_maxiter: int,
+    sigma0: float = 0.3,
+    actuator_sigma0: float = 3.0,
+    popsize: int = 20,
+) -> Tuple[List[int], float]:
+    """Optimize actuator locations to maximize containment probability.
+    
+    This performs a nested optimization where:
+    - Outer loop: CMA-ES optimizes actuator locations
+    - Inner loop: For each actuator configuration, CMA-ES optimizes the policy
+    
+    Returns
+    -------
+    actuator_indices : list of int
+        Optimal actuator locations (0-indexed)
+    best_containment_prob : float
+        Best containment probability achieved
+    """
+    print("\n" + "=" * 70)
+    print("STEP 1: OPTIMAL ACTUATOR PLACEMENT")
+    print("=" * 70)
+    print(f"Optimizing {num_actuators} actuator locations...")
+    print(f"  Sensors: {sensed_dims}")
+    print(f"  Target: x_{target_variable + 1} (index {target_variable})")
+    print(f"  Threshold: {threshold}")
+    print(f"  Objective: Maximize P(x_{target_variable + 1} > {threshold})")
+    
+    # Simulation configuration
+    sim_config = SimulationConfig(
+        N=N,
+        F=F,
+        dt=dt,
+        T=T,
+        transient=transient,
+        target_variable=target_variable,
+        seed=seed,
+    )
+    
+    # Objective configuration
+    objective_config = ControlObjectiveConfig(
+        threshold=threshold,
+        lambda_control=lambda_control,
+        c_max=c_max,
+        bin_width=bin_width,
+        lb_seed=seed,
+        lb_maxiter=lb_maxiter,
+    )
+    
+    # Create actuator objective
+    obj = ActuatorObjective(
+        sensed_dims=sensed_dims,
+        num_actuators=num_actuators,
+        N=N,
+        sim_config=sim_config,
+        objective_config=objective_config,
+        poly_order=poly_order,
+        sigma0=sigma0,
+        maxiter=policy_maxiter,
+        seed=seed,
+    )
+    
+    # Initial guess (uniformly spaced)
+    if num_actuators == 1:
+        mean0 = np.array([N / 2.0])
+    else:
+        spacing = N / num_actuators
+        mean0 = (np.arange(num_actuators) + 0.5) * spacing
+    
+    lower, upper = 0.0, float(N - 1)
+    
+    print(f"\nRunning CMA-ES for actuator optimization...")
+    print(f"  Outer iterations (actuators): {maxiter}")
+    print(f"  Inner iterations (policy per actuator config): {policy_maxiter}")
+    print(f"  WARNING: This is a nested optimization and may take significant time!")
+    
+    es = cma.CMAEvolutionStrategy(
+        mean0,
+        actuator_sigma0,
+        {
+            "bounds": [lower, upper],
+            "maxiter": maxiter,
+            "popsize": popsize,
+            "verb_disp": 1,
+            "seed": seed,
+        },
+    )
+    es.optimize(obj)
+    
+    if es.result is None:
+        raise RuntimeError("CMA-ES did not return a result for actuator optimization.")
+    
+    best_theta = es.result.xbest
+    if not np.all(np.isfinite(best_theta)):
+        best_theta = mean0
+    
+    if np.isfinite(es.result.fbest):
+        best_containment_prob = -float(es.result.fbest)
+    else:
+        best_containment_prob = 0.0
+    
+    actuator_indices = obj.decode_parameters(best_theta)
+    
+    print(f"\nActuator optimization complete!")
+    print(f"  Best containment probability: {best_containment_prob:.6f}")
+    print(f"  Optimal actuator indices:")
+    for i, idx in enumerate(actuator_indices, start=1):
+        print(f"    Actuator {i}: x_{idx + 1} (index {idx})")
+    print("=" * 70)
+    
+    return actuator_indices, best_containment_prob
+
+
+# --------------------------------------------------------------------------- #
 # Command-line interface
 # --------------------------------------------------------------------------- #
 
@@ -1082,7 +1361,7 @@ def main():
     args = parse_args()
     
     print("=" * 70)
-    print("Lorenz 96 System: Integrated Sensor + Control Optimization")
+    print("Lorenz 96 System: Integrated Sensor + Actuator + Control Optimization")
     print("=" * 70)
     
     # Determine sensor indices
@@ -1137,17 +1416,86 @@ def main():
         )
         print(f"\nSensor results saved to: {sensor_output}")
     
-    actuated_dims = args.actuate
+    # Determine actuator indices
+    actuated_dims = None
+    actuator_containment_prob = None
+    actuator_optimized = False
+    
+    if args.actuate is not None:
+        # Manual actuator specification (highest priority)
+        actuated_dims = args.actuate
+        print(f"\nUsing manually specified actuator indices: {actuated_dims}")
+    elif args.auto_actuators:
+        # Auto-optimize actuators
+        print(f"\nAutomatically optimizing actuator locations...")
+        actuator_indices, actuator_containment_prob = optimize_actuator_locations(
+            sensed_dims=sensed_dims,
+            num_actuators=args.num_actuators,
+            N=args.N,
+            F=args.F,
+            dt=args.dt,
+            T=args.T,
+            transient=args.transient,
+            target_variable=args.target_variable,
+            threshold=args.threshold,
+            c_max=args.c_max,
+            lambda_control=args.lambda_control,
+            bin_width=args.bin_width,
+            lb_maxiter=args.lb_maxiter,
+            poly_order=args.poly_order,
+            seed=args.seed,
+            maxiter=args.actuator_maxiter,
+            policy_maxiter=args.actuator_policy_maxiter,
+            sigma0=args.sigma0,
+        )
+        actuated_dims = actuator_indices
+        actuator_optimized = True
+        
+        # Save actuator results
+        actuator_output = f"actuators_auto_{args.num_actuators}.npz"
+        np.savez(
+            actuator_output,
+            actuator_indices=np.array(actuator_indices, dtype=int),
+            best_containment_prob=actuator_containment_prob,
+            num_actuators=args.num_actuators,
+            sensed_dims=np.array(sensed_dims, dtype=int),
+            target_variable=args.target_variable,
+            threshold=args.threshold,
+            N=args.N,
+            F=args.F,
+            c_max=args.c_max,
+            seed=args.seed,
+        )
+        print(f"\nActuator results saved to: {actuator_output}")
+    else:
+        # Use default (backward compatibility)
+        actuated_dims = [2]
+        print(f"\nUsing default actuator indices: {actuated_dims}")
+        print("(Use --actuate to specify manually or --auto-actuators to optimize automatically)")
     
     # Generate automatic filename if using default
     if args.output == "policy.npz":
         c_max_str = f"cm{args.c_max}".replace(".", "p")
         actuate_str = "_".join(str(d) for d in actuated_dims)
         poly_str = str(args.poly_order)
-        args.output = f"policy_{c_max_str}_act{actuate_str}_p{poly_str}.npz"
+        if actuator_optimized:
+            args.output = f"policy_{c_max_str}_actopt{len(actuated_dims)}_p{poly_str}.npz"
+        else:
+            args.output = f"policy_{c_max_str}_act{actuate_str}_p{poly_str}.npz"
+    
+    if actuator_optimized:
+        print("\n" + "=" * 70)
+        print("NOTE: Actuators were optimized automatically!")
+        print("=" * 70)
+        print(f"The policy was already optimized during actuator search.")
+        print(f"Now performing final policy refinement with full iterations...")
+        print("=" * 70 + "\n")
     
     print("\n" + "=" * 70)
-    print("STEP 2: CONTROL POLICY OPTIMIZATION")
+    if actuator_optimized:
+        print("STEP 2: FINAL POLICY REFINEMENT")
+    else:
+        print("STEP 2: CONTROL POLICY OPTIMIZATION")
     print("=" * 70)
     print(f"System: N = {args.N}, F = {args.F}")
     print(f"Actuated indices: {actuated_dims}")
@@ -1248,11 +1596,18 @@ def main():
     if sensor_mi is not None:
         save_data["sensor_mutual_information"] = sensor_mi
     
+    # Add actuator optimization info if available
+    if actuator_optimized and actuator_containment_prob is not None:
+        save_data["actuator_optimized"] = True
+        save_data["actuator_containment_prob"] = actuator_containment_prob
+    
     np.savez(args.output, **save_data)
     print(f"\nPolicy saved to: {args.output}")
     print(f"Alpha scaling parameters: {policy._alphas}")
     if sensor_mi is not None:
         print(f"Sensor mutual information: {sensor_mi:.6f} nats")
+    if actuator_optimized and actuator_containment_prob is not None:
+        print(f"Actuator optimization containment prob: {actuator_containment_prob:.6f}")
 
 
 if __name__ == "__main__":
